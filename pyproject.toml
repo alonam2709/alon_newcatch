@@ -9,4 +9,7 @@ keywords = ["mcp", "llm", "alpic", "python"]
 dependencies = [
     "black>=25.1.0",
     "mcp",
+    "boto3>=1.28.0",
+    "requests>=2.31.0",
+    "mistralai>=0.4.0",
 ]
