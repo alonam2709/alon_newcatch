@@ -2,18 +2,30 @@
 Bluff Judge 
 Follows the "MCP Server Template" structure.
 """
-from typing import Dict, Any, Optional
+import os, re, time 
+from typing import Dict, Any, List, Optional
 from fastmcp import FastMCP, Context
 #from mcp.server.fastmcp import FastMCP, Context
 from pydantic import Field  
+from huggingface_hub import HfApi
 
 import mcp.types as types
-
+# -------------------------------------------------
+# PUBLIC URL AND DATASET
+RECORDER_URL = "https://huggingface.co/spaces/alonam27/catchmeow-voice-recorder"
+HF_DATASET = os.environ.get("HF_DATASET", "alonam27/catchmeow-audio")
 mcp = FastMCP("Catch Meow Main Server", port=3000, stateless_http=True, debug=True)
 
 # Simple in-memory store keyed by client_id for now there is only 8 people maximum 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-
+# Session shape we’ll maintain:
+# SESSIONS[client_id] = {
+#   "start_ts": int,            # when baseline started (unix seconds)
+#   "current_prompt": int,      # 1..3
+#   "answers": { "1": path, ... },
+#   "used_paths": set([...]),   # to avoid reusing files
+#   "recorder_url": str
+# }
 # The 5 recording prompts that will always be asked
 RECORDING_PROMPTS: Dict[str, str] = {
     "1": "Can you tell me your name and your favorite color, and count from 1 to 10.",
@@ -22,6 +34,37 @@ RECORDING_PROMPTS: Dict[str, str] = {
     "4": "This match runs on Alpic-hosted MCP servers; Mistral guides prompts; Qdrant stores vectors; Weave from Weights and Biases logs decisions. Our bluff judge is deterministic; features are weighted, scores are banded, and every call is traced and versioned for review.",
     "5": "What did you do last night? (Truth & Lie)"
 }
+# ---------- helpers ----------
+def _client_id() -> str:
+    # TODO: wire to real user/session later
+    return "anonymous"
+
+def _api() -> HfApi:
+    # Works fine without token for public datasets
+    return HfApi()
+
+def _list_wav_paths_since(start_ts: int) -> List[str]:
+    """
+    List dataset files like '1699999999_*.wav' with leading epoch >= start_ts.
+    Relies on your uploader's filename: f"{int(time.time())}_{base}.wav"
+    """
+    if not HF_DATASET:
+        raise RuntimeError("HF_DATASET is not set")
+    files = _api().list_repo_files(repo_id=HF_DATASET, repo_type="dataset")
+    pat = re.compile(r"^(\d+)_.*\.wav$", re.IGNORECASE)
+
+    out = []
+    for f in files:
+        m = pat.match(f)
+        if not m:
+            continue
+        ts = int(m.group(1))
+        if ts >= start_ts:
+            out.append(f)
+
+    # Oldest first so we consume in order
+    out.sort(key=lambda p: int(re.match(r"^(\d+)_", p).group(1)))
+    return out
 
 # -------------------------------------------------------------------
 # TOOLS - Functions that can be called by the LLM during conversation
@@ -61,7 +104,7 @@ async def save_profile(
     TOOL PURPOSE: Stores player profile information for personalization
     USAGE: Called after start_game to save user details
     """
-    client_id = "anonymous"  # Simplified for now
+    client_id = _client_id() # Basic for now
     SESSIONS[client_id] = {
         "name": name.strip(),
         "age": age,
@@ -70,11 +113,11 @@ async def save_profile(
     result = {
         "ok": True,
         "stored": SESSIONS[client_id],
-        # Put your deployed recorder page here:
-        "recorder_url": "https://your-recorder.example/baseline",
+        "recorder_url": RECORDER_URL,
         "next_hint": "Open the recorder URL to capture baseline audio, then return."
     }
     return str(result)
+
 # Will be used to change the color of the page based of the favourit color of the player
 @mcp.tool(
     title="Get Profile",
@@ -86,10 +129,9 @@ async def get_profile() -> str:
     NECESSITY: Not needed if profiles aren't being used
     USAGE: Called to get stored user profile data
     """
-    client_id = "anonymous"  # Simplified for now
+    client_id = _client_id()  # Simplified for now
     result = {"profile": SESSIONS.get(client_id)}
     return str(result)
-
 @mcp.tool(
     title="Get Recording Prompt",
     description="Get a specific recording prompt (question or reading text) for the session."
@@ -132,18 +174,76 @@ async def list_all_recording_prompts() -> str:
     }
     return str(result)
 
-# -------------------------------------------------------------------
-# PROMPTS - Pre-defined prompt templates for the LLM
-# -------------------------------------------------------------------
+@mcp.tool(
+    title="Start Baseline Recording",
+    description="Sends the recorder link + first 3 prompts and opens a validation window."
+)
+async def start_baseline_recording() -> str:
+    cid = _client_id()
+    SESSIONS[cid] = {
+        "start_ts": int(time.time()),
+        "current_prompt": 1,
+        "answers": {},
+        "used_paths": set(),
+        "recorder_url": RECORDER_URL,
+    }
+    p1 = RECORDING_PROMPTS["1"]
+    p2 = RECORDING_PROMPTS["2"]
+    p3 = RECORDING_PROMPTS["3"]
+    return (
+        f"🎮 Baseline started!\n\n"
+        f"Recorder: {RECORDER_URL}\n\n"
+        f"Please record answers to these, one by one (click **Send** each time):\n"
+        f"1) {p1}\n"
+        f"2) {p2}\n"
+        f"3) {p3}\n\n"
+        f"After each Send, call **Validate Next Upload**."
+    )
 
+@mcp.tool(
+    title="Validate Next Upload",
+    description="Finds the next new .wav since the session started and advances to the next prompt."
+)
+async def validate_next_upload() -> str:
+    cid = _client_id()
+    sess = SESSIONS.get(cid)
+    if not sess:
+        return "No active session. Call **Start Baseline Recording** first."
+
+    if sess["current_prompt"] > 3:
+        return "✅ All three baseline answers are already validated. Great job!"
+
+    try:
+        candidates = _list_wav_paths_since(sess["start_ts"])
+    except Exception as e:
+        return f"⚠️ Could not list dataset files: {e}"
+
+    # first candidate not yet used
+    new_path = next((p for p in candidates if p not in sess["used_paths"]), None)
+    if not new_path:
+        return "⏳ I don’t see a new WAV yet. Make sure you clicked **Send** on the recorder, then run this tool again."
+
+    prompt_id = str(sess["current_prompt"])
+    sess["answers"][prompt_id] = new_path
+    sess["used_paths"].add(new_path)
+    sess["current_prompt"] += 1
+
+    ack = f"🎉 Great, amazing answer for {prompt_id}! (saved: {new_path})"
+
+    if sess["current_prompt"] <= 3:
+        next_id = str(sess["current_prompt"])
+        next_prompt = RECORDING_PROMPTS[next_id]
+        return f"{ack}\n\nNext up — Prompt {next_id}:\n{next_prompt}"
+    else:
+        return f"{ack}\n\n✅ All three baseline prompts are complete. Thank you!"
+
+# -------------------------------------------------------------------
+# PROMPTS
+# -------------------------------------------------------------------
 @mcp.prompt("Voice recording instructions")
 async def voice_recording_instructions(
     session_type: str = Field(description="Type of recording session: baseline, truth, lie", default="baseline")
 ) -> str:
-    """
-    PROMPT PURPOSE: Instructions for conducting voice recording sessions
-    USAGE: Guide the LLM on how to conduct different types of recording sessions
-    """
     instructions = {
         "baseline": "You are conducting a baseline voice recording session. Ask the participant to speak naturally and clearly. Record their normal speech patterns, tone, and pace. Be encouraging and create a comfortable atmosphere.",
         "truth": "You are conducting a truth recording session. Instruct the participant to answer all questions honestly and naturally. Emphasize that they should tell the truth and speak as they normally would.",
